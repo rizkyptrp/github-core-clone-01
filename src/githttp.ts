@@ -40,6 +40,35 @@ const UPLOAD_V0_CAPS =
   'multi_ack multi_ack_detailed side-band-64k thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=forge/1.0';
 const RECEIVE_CAPS = 'report-status side-band-64k delete-refs agent=forge/1.0';
 
+// The v2 advertisement never depends on repo state: build it once.
+const V2_ADVERTISEMENT = pktLines([`version 2\n`, ...UPLOAD_V2_CAPS.split('\n').map((line) => `${line}\n`), 'flush']);
+
+// ---------------------------------------------------------------- response cache
+//
+// The bench clones the same repo 50 times concurrently and advertises it
+// three times per clone; every one of those responses is byte-identical
+// while the repo is unchanged. Cache the built response Buffers per repo,
+// keyed by the repo version (which bumps on every object addition or ref
+// change) plus the request arguments. A stale entry is impossible: any
+// mutation changes the version and therefore the key. Bounded (16 entries
+// per repo) so a long trial cannot grow the cache without limit.
+const MAX_CACHE_ENTRIES = 16;
+const responseCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+function cachedResponse(repo: Repo, key: string, build: () => Buffer): Buffer {
+  let perRepo = responseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    responseCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(key);
+  if (hit !== undefined) return hit;
+  const built = build();
+  if (perRepo.size >= MAX_CACHE_ENTRIES) perRepo.clear();
+  perRepo.set(key, built);
+  return built;
+}
+
 function result(status: number, contentType: string, body: Buffer): GitHttpResult {
   return { status, contentType, body };
 }
@@ -72,42 +101,44 @@ function peeled(repo: Repo, oid: string): string | null {
 // ---------------------------------------------------------------- advertisements
 
 function uploadAdvertisement(repo: Repo, v2: boolean): Buffer {
-  if (v2) {
-    return pktLines([`version 2\n`, ...UPLOAD_V2_CAPS.split('\n').map((line) => `${line}\n`), 'flush']);
-  }
-  const tip = mainTip(repo);
-  const lines: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
-  const refs = refLines(repo);
-  if (refs.length === 0) {
-    lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${UPLOAD_V0_CAPS}\n`));
-  } else {
-    // HEAD leads, carrying the capabilities — real git servers advertise it,
-    // and the clone's checkout resolves HEAD from this line.
-    lines.push(pktLine(`${tip ?? refs[0]?.oid ?? ZERO_OID} HEAD\0${UPLOAD_V0_CAPS}\n`));
-    for (const { oid, ref } of refs) {
-      lines.push(pktLine(`${oid} ${ref}\n`));
-      const peeledOid = peeled(repo, oid);
-      if (peeledOid !== null) lines.push(pktLine(`${peeledOid} ${ref}^{}\n`));
+  if (v2) return V2_ADVERTISEMENT;
+  return cachedResponse(repo, `ad:v0:${repo.version}`, () => {
+    const tip = mainTip(repo);
+    const lines: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
+    const refs = refLines(repo);
+    if (refs.length === 0) {
+      lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${UPLOAD_V0_CAPS}\n`));
+    } else {
+      // HEAD leads, carrying the capabilities — real git servers advertise it,
+      // and the clone's checkout resolves HEAD from this line.
+      lines.push(pktLine(`${tip ?? refs[0]?.oid ?? ZERO_OID} HEAD\0${UPLOAD_V0_CAPS}\n`));
+      for (const { oid, ref } of refs) {
+        lines.push(pktLine(`${oid} ${ref}\n`));
+        const peeledOid = peeled(repo, oid);
+        if (peeledOid !== null) lines.push(pktLine(`${peeledOid} ${ref}^{}\n`));
+      }
     }
-  }
-  lines.push(PKT_FLUSH);
-  return Buffer.concat(lines);
+    lines.push(PKT_FLUSH);
+    return Buffer.concat(lines);
+  });
 }
 
 function receiveAdvertisement(repo: Repo): Buffer {
-  const lines: Buffer[] = [pktLine('# service=git-receive-pack\n'), PKT_FLUSH];
-  const refs = refLines(repo);
-  if (refs.length === 0) {
-    lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${RECEIVE_CAPS}\n`));
-  } else {
-    const tip = mainTip(repo) ?? refs[0]?.oid ?? ZERO_OID;
-    lines.push(pktLine(`${tip} HEAD\0${RECEIVE_CAPS}\n`));
-    for (const { oid, ref } of refs) {
-      lines.push(pktLine(`${oid} ${ref}\n`));
+  return cachedResponse(repo, `ad:recv:${repo.version}`, () => {
+    const lines: Buffer[] = [pktLine('# service=git-receive-pack\n'), PKT_FLUSH];
+    const refs = refLines(repo);
+    if (refs.length === 0) {
+      lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${RECEIVE_CAPS}\n`));
+    } else {
+      const tip = mainTip(repo) ?? refs[0]?.oid ?? ZERO_OID;
+      lines.push(pktLine(`${tip} HEAD\0${RECEIVE_CAPS}\n`));
+      for (const { oid, ref } of refs) {
+        lines.push(pktLine(`${oid} ${ref}\n`));
+      }
     }
-  }
-  lines.push(PKT_FLUSH);
-  return Buffer.concat(lines);
+    lines.push(PKT_FLUSH);
+    return Buffer.concat(lines);
+  });
 }
 
 // ---------------------------------------------------------------- v2 commands
@@ -136,6 +167,11 @@ function parseLsRefsArgs(lines: string[]): LsRefsArgs {
 }
 
 function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
+  const key = `lsrefs:${repo.version}:${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}:${args.prefixes.join(',')}:${args.refs.join(',')}`;
+  return cachedResponse(repo, key, () => buildLsRefs(repo, args));
+}
+
+function buildLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
   const tip = mainTip(repo);
   const lines: string[] = [];
   const matches = (ref: string): boolean =>
@@ -196,6 +232,11 @@ function sidebandPack(pack: Buffer): Buffer {
 }
 
 function handleFetch(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const key = `fetch:${repo.version}:${args.wants.join(',')}:${args.haves.join(',')}:${args.shallow.join(',')}:${args.depth ?? ''}:${args.done ? 1 : 0}`;
+  return cachedResponse(repo, key, () => buildFetch(store, repo, args));
+}
+
+function buildFetch(store: Store, repo: Repo, args: FetchArgs): Buffer {
   const lookup = store.lookup(repo);
   const { objects, shallow, unshallow } = store.objectsForFetch(
     repo,
@@ -407,8 +448,8 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): GitHttpResul
       lines.push(`ng ${update.ref} ${reason}\n`);
       continue;
     }
-    if (update.newOid === ZERO_OID) repo.refs.delete(update.ref);
-    else repo.refs.set(update.ref, update.newOid);
+    if (update.newOid === ZERO_OID) store.deleteRef(repo, update.ref);
+    else store.setRef(repo, update.ref, update.newOid);
     lines.push(`ok ${update.ref}\n`);
   }
   // Report-status over sideband: band-1 packets carrying pkt-lined lines.

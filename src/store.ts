@@ -93,6 +93,8 @@ export interface Repo {
   readonly comments: Map<number, Comment>;
   nextNumber: number;
   readonly createdSeq: number;
+  /** Bumps on every object addition or ref change; invalidates git caches. */
+  version: number;
 }
 
 const TRIAL_NOW = process.env.MAKEFUN_TRIAL_NOW ?? '';
@@ -173,6 +175,7 @@ export class Store {
       comments: new Map(),
       nextNumber: 1,
       createdSeq: this.nextRepoSeq,
+      version: 0,
     };
     this.nextRepoId += 1;
     this.nextRepoSeq += 1;
@@ -188,8 +191,23 @@ export class Store {
 
   putObject(repo: Repo, type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data });
+      repo.version += 1;
+    }
     return oid;
+  }
+
+  /** Move a ref (or create it); bumps the repo version for git caches. */
+  setRef(repo: Repo, ref: string, oid: string): void {
+    repo.refs.set(ref, oid);
+    repo.version += 1;
+  }
+
+  /** Delete a ref; bumps the repo version for git caches. */
+  deleteRef(repo: Repo, ref: string): void {
+    repo.refs.delete(ref);
+    repo.version += 1;
   }
 
   lookup(repo: Repo): (oid: string) => GitObject | undefined {
@@ -499,7 +517,7 @@ export class Store {
       timestamp: this.nextCommitTime(),
     });
     const sha = this.putObject(repo, 'commit', commit);
-    repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+    this.setRef(repo, `refs/heads/${pull.baseRef}`, sha);
     const now = this.nowIso();
     pull.state = 'closed';
     pull.merged = true;

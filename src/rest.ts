@@ -6,7 +6,6 @@
 // login the bearer token names: the same name under any other owner is a 404,
 // never a 403.
 
-import type { IncomingMessage } from 'node:http';
 import { parseCommit, parseTree, type GitObject } from './gitobj.ts';
 import { DEFAULT_BRANCH, type Issue, type Label, type PullRequest, type Repo, type Store } from './store.ts';
 
@@ -166,7 +165,8 @@ function contentJson(store: Store, repo: Repo, path: string, blobOid: string, br
 
 interface Ctx {
   readonly store: Store;
-  readonly req: IncomingMessage;
+  readonly method: string;
+  readonly host: string;
   readonly segments: string[];
   readonly query: URLSearchParams;
   readonly body: Body | null;
@@ -194,7 +194,7 @@ function defaultTip(store: Store, repo: Repo): string | undefined {
 
 export function handleRest(ctx: Ctx): RestResult {
   const s = ctx.segments; // after /api/v3
-  const method = (ctx.req.method ?? 'GET').toUpperCase();
+  const method = ctx.method;
   if (s.length === 0) {
     return ok(200, { current_user_url: '/api/v3/user', repository_url: '/api/v3/repos/{owner}/{repo}' }, {
       'X-OAuth-Scopes': 'repo, read:org',
@@ -243,7 +243,7 @@ function userRepos(ctx: Ctx, method: string): RestResult {
     const all = ctx.store.viewerRepos();
     const slice = all.slice((page - 1) * perPage, page * perPage);
     const headers: Record<string, string> = {};
-    const host = ctx.req.headers.host ?? 'localhost';
+    const host = ctx.host;
     const base = `http://${host}/api/v3/user/repos`;
     const links: string[] = [];
     if (page * perPage < all.length) links.push(`<${base}?per_page=${perPage}&page=${page + 1}>; rel="next"`);
@@ -294,7 +294,7 @@ function gitRefs(ctx: Ctx, repo: Repo, method: string, rest: string[]): RestResu
     if (!/^[0-9a-f]{40}$/.test(sha)) return error(422, 'sha must be a 40-hex object id');
     if (!repo.objects.has(sha)) return error(422, `object ${sha} does not exist`);
     if (repo.refs.has(ref)) return error(422, `ref ${ref} already exists`);
-    repo.refs.set(ref, sha);
+    ctx.store.setRef(repo, ref, sha);
     return ok(201, { ref, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' }, url: '' });
   }
   if (method === 'GET' && rest.length >= 2) {
@@ -409,7 +409,7 @@ function contents(ctx: Ctx, repo: Repo, method: string, rest: string[]): RestRes
     }
     const isCreate = existing === undefined;
     const commitOid = ctx.store.commitFiles(repo, parent ?? null, new Map([[path, content]]), message);
-    repo.refs.set(`refs/heads/${targetBranch}`, commitOid);
+    ctx.store.setRef(repo, `refs/heads/${targetBranch}`, commitOid);
     const blobOid = ctx.store.blobAt(repo, commitOid, path) as string;
     return ok(isCreate ? 201 : 200, {
       content: contentJson(ctx.store, repo, path, blobOid, targetBranch),
@@ -426,7 +426,7 @@ function contents(ctx: Ctx, repo: Repo, method: string, rest: string[]): RestRes
     if (existing === undefined) return error(404, 'Not Found');
     if (sha !== '' && existing !== sha) return error(409, 'sha does not match the current file');
     const commitOid = ctx.store.commitFiles(repo, parent, new Map([[path, null]]), message || `Delete ${path}`);
-    repo.refs.set(`refs/heads/${targetBranch}`, commitOid);
+    ctx.store.setRef(repo, `refs/heads/${targetBranch}`, commitOid);
     return ok(200, { commit: { sha: commitOid, message } });
   }
   return error(404, 'Not Found');
